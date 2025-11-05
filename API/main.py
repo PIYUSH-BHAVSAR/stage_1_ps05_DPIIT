@@ -1,118 +1,110 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from pathlib import Path
 from PIL import Image
-import json, io, zipfile, base64
+import io, base64
 
 app = FastAPI()
 
 # ✅ Allow frontend access (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change "*" to your domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Load model once
-model = YOLO(r"D:\projects\MULTILINGUAL_OCR\multilingual_doc_understanding\ovr_v2\runs\detect\train3\weights\best.pt")
+# ✅ Load YOLO model (relative path)
+MODEL_PATH = Path(__file__).parent / "model" / "best.pt"
+model = YOLO(str(MODEL_PATH))
 
-# ---------- Deskew ----------
+# ------------------------- DESKEW FUNCTION ------------------------
+def deskew_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    gray_inv = cv2.bitwise_not(gray)
+
+    thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return img, 0.0
+
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+
+    angle = -angle
+
+    (h, w) = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+    return rotated, angle
 
 
-def deskew_image(image: Image.Image):
-    # Convert PIL → OpenCV (BGR)
+# ------------------------- PREDICTION FUNCTION --------------------
+def process_image(image: Image.Image):
+    # Convert PIL → CV2 (BGR)
     img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-    # Convert to Grayscale
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    # ✅ Deskew correctly
+    deskewed_cv, angle = deskew_image(img_cv)
 
-    # Edge detection
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    # ✅ YOLO inference on deskewed image
+    results = model.predict(
+        deskewed_cv,
+        imgsz=960,
+        conf=0.25,
+        save=False,
+        verbose=False
+    )
 
-    # Hough line transform
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 100)
-
-    if lines is not None:
-        angles = []
-
-        for rho, theta in lines[:, 0]:
-            angle = np.degrees(theta)
-
-            # Normalize angle to range [-45, 45]
-            if angle < 45:
-                angles.append(angle)
-            elif angle > 135:
-                angles.append(angle - 180)
-
-        # Check if angle list is not empty
-        if len(angles) > 0:
-            median_angle = np.median(angles)
-
-            # Rotate image to deskew
-            (h, w) = img_cv.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-            
-            rotated = cv2.warpAffine(
-                img_cv, M, (w, h),
-                flags=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_REPLICATE
-            )
-
-            # Convert back OpenCV → PIL
-            return Image.fromarray(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))
-
-    # If no skew is detected → return original
-    return image
-
-# ---------- Prediction ----------
-def process_image(image: Image.Image):
-    deskewed_image = deskew_image(image)
-    img_array = np.array(deskewed_image)
-    results = model(img_array)
     result = results[0]
     boxes = result.boxes
 
     annotations = []
     for box in boxes:
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        conf = box.conf[0].item()
-        cls = int(box.cls[0].item())
-        class_name = result.names[cls]
-        annotations.append(
-            {"bbox": [x1, y1, x2, y2], "confidence": conf, "class": class_name}
-        )
+        x_center, y_center, w, h = box.xywh[0].tolist()
+        cls_id = int(box.cls[0].item())
 
-    annotated_img = img_array.copy()
-    for ann in annotations:
-        x1, y1, x2, y2 = [int(c) for c in ann["bbox"]]
-        cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            annotated_img,
-            f"{ann['class']} {ann['confidence']:.2f}",
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            2,
-        )
+        # Convert center → top-left format
+        x = float(x_center - w / 2)
+        y = float(y_center - h / 2)
 
-    annotated_pil = Image.fromarray(annotated_img)
+        annotations.append({
+            "bbox": [x, y, float(w), float(h)],
+            "category_id": cls_id + 1  # ✅ 0-index → 1-index
+        })
+
+    # ✅ Get annotated deskewed image
+    annotated_cv = result.plot()
+
+    # Convert CV2 → PIL
+    annotated_pil = Image.fromarray(annotated_cv)
+
     return annotations, annotated_pil
 
 
-# ---------- Single Image API ----------
+# ------------------------- API ENDPOINT ---------------------------
 @app.post("/predict/single")
 async def predict_single(file: UploadFile = File(...)):
     contents = await file.read()
-    image = Image.open(io.BytesIO(contents))
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+
     annotations, annotated_image = process_image(image)
 
     img_byte_arr = io.BytesIO()
