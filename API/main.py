@@ -6,7 +6,7 @@ import numpy as np
 from ultralytics import YOLO
 from pathlib import Path
 from PIL import Image
-import io, base64
+import io, base64, os
 
 app = FastAPI()
 
@@ -19,16 +19,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Load YOLO model (relative path)
+# ✅ Load YOLO model using a deploy-safe relative path
 MODEL_PATH = Path(__file__).parent / "model" / "best.pt"
 model = YOLO(str(MODEL_PATH))
+
 
 # ------------------------- DESKEW FUNCTION ------------------------
 def deskew_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     gray_inv = cv2.bitwise_not(gray)
-
     thresh = cv2.threshold(gray_inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
 
     coords = np.column_stack(np.where(thresh > 0))
@@ -58,13 +57,10 @@ def deskew_image(img):
 
 # ------------------------- PREDICTION FUNCTION --------------------
 def process_image(image: Image.Image):
-    # Convert PIL → CV2 (BGR)
     img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-    # ✅ Deskew correctly
     deskewed_cv, angle = deskew_image(img_cv)
 
-    # ✅ YOLO inference on deskewed image
     results = model.predict(
         deskewed_cv,
         imgsz=960,
@@ -80,20 +76,15 @@ def process_image(image: Image.Image):
     for box in boxes:
         x_center, y_center, w, h = box.xywh[0].tolist()
         cls_id = int(box.cls[0].item())
-
-        # Convert center → top-left format
         x = float(x_center - w / 2)
         y = float(y_center - h / 2)
 
         annotations.append({
             "bbox": [x, y, float(w), float(h)],
-            "category_id": cls_id + 1  # ✅ 0-index → 1-index
+            "category_id": cls_id + 1
         })
 
-    # ✅ Get annotated deskewed image
     annotated_cv = result.plot()
-
-    # Convert CV2 → PIL
     annotated_pil = Image.fromarray(annotated_cv)
 
     return annotations, annotated_pil
@@ -115,3 +106,10 @@ async def predict_single(file: UploadFile = File(...)):
         "annotations": annotations,
         "annotated_image_base64": encoded_img
     })
+
+
+# ------------------------- RENDER DEPLOY FIX ----------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))  # ✅ Required for Render
+    uvicorn.run(app, host="0.0.0.0", port=port)
